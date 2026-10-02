@@ -13,6 +13,7 @@ These tests validate:
 - transition detection
 - directional efficiency
 - persistence
+- volatility regime separation
 - no-look-ahead behavior
 
 Important:
@@ -36,9 +37,6 @@ from core.regime_engine import (
     _self_test,
     classify,
 )
-
-
-BASE_TIMESTAMP = 1_800_000_000
 
 
 def make_uptrend(
@@ -135,20 +133,89 @@ def make_high_volatility(
     base: float = 100.0,
 ) -> list[float]:
     """
-    Create a deterministic high-volatility regime in the final half
-    of the series.
+    Create a deterministic volatility-regime transition.
+
+    Structure:
+
+        first half  -> very low volatility
+        second half -> high volatility
+
+    The important property is that the historical reference window
+    immediately preceding the current window remains low-volatility.
     """
+
+    if rows < 40:
+        raise ValueError(
+            "rows must be at least 40"
+        )
 
     prices = [base]
 
+    transition = rows // 2
+
     for index in range(1, rows):
-        if index < rows // 2:
-            step = 0.02
+        if index < transition:
+            # Extremely small deterministic movement.
+            step = (
+                0.002
+                if index % 2
+                else -0.002
+            )
         else:
-            step = 3.0 if index % 2 else -3.0
+            # Large alternating movement.
+            step = (
+                3.0
+                if index % 2
+                else -3.0
+            )
 
         prices.append(
             prices[-1] + step
+        )
+
+    return prices
+
+
+def make_flat_then_volatile(
+    *,
+    flat_points: int = 40,
+    volatile_points: int = 10,
+    base: float = 100.0,
+    step: float = 2.0,
+) -> list[float]:
+    """
+    Create an exactly-zero historical volatility baseline followed by
+    a volatile current window.
+
+    This specifically tests the mathematically valid infinite
+    volatility-ratio case.
+    """
+
+    if flat_points < 2:
+        raise ValueError(
+            "flat_points must be at least 2"
+        )
+
+    if volatile_points < 2:
+        raise ValueError(
+            "volatile_points must be at least 2"
+        )
+
+    prices = [
+        base
+        for _ in range(flat_points)
+    ]
+
+    for index in range(volatile_points):
+        direction = (
+            1.0
+            if index % 2 == 0
+            else -1.0
+        )
+
+        prices.append(
+            prices[-1]
+            + direction * step
         )
 
     return prices
@@ -360,21 +427,43 @@ def test_range_market_does_not_create_strong_directional_signal():
 
 
 def test_high_volatility_is_detected():
-    prices = make_high_volatility()
+    """
+    The historical reference window must remain low-volatility while
+    the current window is highly volatile.
+    """
+
+    prices = make_high_volatility(
+        rows=100,
+    )
 
     result = classify(
         prices=prices,
+        volatility_window=20,
     )
 
     assert result.volatility > 0.0
 
-    assert result.volatility_ratio >= 1.0
+    assert result.volatility_ratio > 1.0
 
-    assert result.regime == MarketRegime.HIGH_VOLATILITY
+    assert (
+        result.volatility_ratio
+        >= 1.50
+    )
+
+    assert result.regime == (
+        MarketRegime.HIGH_VOLATILITY
+    )
 
 
 def test_low_volatility_is_detected():
-    prices = make_low_volatility()
+    """
+    A stable low-volatility series should never be classified as a
+    directional trend solely because of numerical noise.
+    """
+
+    prices = make_low_volatility(
+        rows=100,
+    )
 
     result = classify(
         prices=prices,
@@ -419,7 +508,9 @@ def test_strong_uptrend_can_be_classified_as_trend_up():
     assert result.persistence > 0.20
     assert result.directional_efficiency > 0.25
 
-    assert result.regime == MarketRegime.TREND_UP
+    assert result.regime == (
+        MarketRegime.TREND_UP
+    )
 
 
 def test_strong_downtrend_can_be_classified_as_trend_down():
@@ -451,11 +542,13 @@ def test_strong_downtrend_can_be_classified_as_trend_down():
     assert result.persistence < -0.20
     assert result.directional_efficiency > 0.25
 
-    assert result.regime == MarketRegime.TREND_DOWN
+    assert result.regime == (
+        MarketRegime.TREND_DOWN
+    )
 
 
 def test_regime_is_always_supported_enum():
-    test_series = [
+    examples = [
         make_uptrend(),
         make_downtrend(),
         make_flat(),
@@ -464,7 +557,7 @@ def test_regime_is_always_supported_enum():
         make_high_volatility(),
     ]
 
-    for prices in test_series:
+    for prices in examples:
         result = classify(
             prices=prices,
         )
@@ -720,9 +813,8 @@ def test_no_look_ahead_behavior():
     """
     The regime at time t must not depend on observations after t.
 
-    We calculate a result on a prefix and verify that appending future
-    observations does not mutate the already-calculated prefix result
-    when the calculation is performed on exactly the same prefix.
+    The same historical prefix must always produce exactly the same
+    result, regardless of whether future data exists elsewhere.
     """
 
     prices = make_uptrend(
@@ -744,10 +836,10 @@ def test_no_look_ahead_behavior():
     assert result_prefix == result_prefix_again
 
 
-def test_future_observations_are_not_used_for_prefix_result():
+def test_future_observations_do_not_change_recomputed_prefix():
     """
-    Explicitly verify that adding future data creates a new observation
-    rather than changing the historical calculation of the prefix.
+    Explicitly verify that the historical prefix remains reproducible
+    after future observations are appended elsewhere.
     """
 
     prices = make_uptrend(
@@ -757,12 +849,13 @@ def test_future_observations_are_not_used_for_prefix_result():
     )
 
     prefix = prices[:80]
+    future = prices[80:]
 
     result_before = classify(
         prices=prefix,
     )
 
-    extended = prefix + prices[80:]
+    extended = prefix + future
 
     result_after = classify(
         prices=extended,
@@ -778,9 +871,8 @@ def test_future_observations_are_not_used_for_prefix_result():
         RegimeResult,
     )
 
-    # The final state may legitimately differ because the observation
-    # point has moved forward. The important property is that the prefix
-    # calculation itself is deterministic and independently reproducible.
+    # The final regime may legitimately change because the observation
+    # point has moved forward. The prefix itself must remain reproducible.
     assert result_before == classify(
         prices=prefix,
     )
@@ -799,21 +891,22 @@ def test_volatility_ratio_is_one_when_both_windows_are_zero():
 
 def test_high_volatility_ratio_can_be_infinite():
     """
-    If the historical baseline volatility is exactly zero while the
-    current window becomes volatile, the ratio is mathematically infinite.
+    Construct the exact mathematical condition:
+
+        historical volatility = 0
+        current volatility > 0
+
+    Therefore:
+
+        current volatility / historical volatility = infinity
     """
 
-    prices = [100.0] * 50
-
-    for index in range(50, 80):
-        prices.append(
-            prices[-1]
-            + (
-                2.0
-                if index % 2
-                else -2.0
-            )
-        )
+    prices = make_flat_then_volatile(
+        flat_points=40,
+        volatile_points=10,
+        base=100.0,
+        step=2.0,
+    )
 
     result = classify(
         prices=prices,
@@ -826,6 +919,15 @@ def test_high_volatility_ratio_can_be_infinite():
         result.volatility_ratio
     )
 
+    assert (
+        result.volatility_ratio
+        > 1.0
+    )
+
+    assert result.regime == (
+        MarketRegime.HIGH_VOLATILITY
+    )
+
 
 def test_confidence_is_bounded_for_all_regime_examples():
     examples = [
@@ -835,6 +937,7 @@ def test_confidence_is_bounded_for_all_regime_examples():
         make_range(),
         make_low_volatility(),
         make_high_volatility(),
+        make_flat_then_volatile(),
     ]
 
     for prices in examples:
@@ -886,3 +989,36 @@ if __name__ == "__main__":
             "-q",
         ]
     )
+
+بعد لصق الملف، نفّذ:
+
+python -m pytest -q
+
+التصحيح الجوهري
+
+الاختبار السابق كان يفترض:
+
+flat → volatile
+
+لكنه فعليًا كان يبني:
+
+flat → volatile → volatile → volatile
+             ↑
+       historical window
+
+لذلك المحرك كان يتصرف رياضيًا بشكل صحيح ويجد أن الحاضر ليس أكثر تقلبًا من مرجعه مباشرة بما يكفي.
+
+النسخة الجديدة تختبر الحالة الصحيحة:
+
+40 نقطة هادئة
+       ↓
+10 نقاط متقلبة
+       ↓
+Historical σ = 0
+Current σ > 0
+       ↓
+Ratio = ∞
+       ↓
+HIGH_VOLATILITY
+
+وبذلك لا نعدل "regime_engine.py" بشكل مصطنع فقط لجعل CI أخضر. الاختبار هو الذي تم تصحيحه ليتوافق مع التعريف الرياضي الذي يدّعي اختباره.
