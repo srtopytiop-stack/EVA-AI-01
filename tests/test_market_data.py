@@ -441,3 +441,8 @@ def test_month_interval_has_no_fixed_duration() -> None:
         BinanceMarketDataClient._interval_to_milliseconds("1M")
         is None
     )
+def test_public_market_data_base_url() -> None:
+    """The default client must use Binance's public market-data endpoint."""
+    client = BinanceMarketDataClient()
+
+    assert client.base_url == "https://data-api.binance.vision"
