@@ -564,18 +564,18 @@ def test_partial_close_with_fee() -> None:
     )
 
     # Entry:
-    #   notional = 2 * 100 = 200
-    #   entry fee = 200 * 0.001 = 0.20
+    # notional = 2 * 100 = 200
+    # entry fee = 200 * 0.001 = 0.20
     #
-    # Half of the position is closed:
-    #   allocated cost basis = (200 + 0.20) / 2 = 100.10
+    # Allocated cost basis for half the position:
+    # 200.20 * (1 / 2) = 100.10
     #
     # Exit:
-    #   exit notional = 1 * 120 = 120
-    #   exit fee = 120 * 0.001 = 0.12
+    # exit notional = 1 * 120 = 120
+    # exit fee = 120 * 0.001 = 0.12
     #
     # Realized PnL:
-    #   120 - 0.12 - 100.10 = 19.78
+    # 120 - 0.12 - 100.10 = 19.78
 
     assert realized == pytest.approx(19.78)
 
@@ -589,7 +589,17 @@ def test_partial_close_with_fee() -> None:
 
     assert snapshot.realized_pnl == pytest.approx(19.78)
     assert snapshot.total_fees == pytest.approx(0.32)
-    assert snapshot.cash == pytest.approx(919.88)
+
+    # Initial cash:
+    # 1000 - 200 - 0.20 = 799.80
+    #
+    # Closing proceeds:
+    # 120 - 0.12 = 119.88
+    #
+    # Final cash:
+    # 799.80 + 119.88 = 919.68
+
+    assert snapshot.cash == pytest.approx(919.68)
 
 
 # ---------------------------------------------------------------------------
