@@ -208,7 +208,7 @@ def install_deterministic_entry_decision(
     remain real production code.
 
     pytest's monkeypatch fixture safely restores the original method after
-    the test. See pytest's monkeypatch documentation.
+    the test.
     """
 
     def deterministic_decision(
