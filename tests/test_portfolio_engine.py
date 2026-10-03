@@ -563,12 +563,33 @@ def test_partial_close_with_fee() -> None:
         fee_rate=0.001,
     )
 
-    assert realized == pytest.approx(19.86)
+    # Entry:
+    #   notional = 2 * 100 = 200
+    #   entry fee = 200 * 0.001 = 0.20
+    #
+    # Half of the position is closed:
+    #   allocated cost basis = (200 + 0.20) / 2 = 100.10
+    #
+    # Exit:
+    #   exit notional = 1 * 120 = 120
+    #   exit fee = 120 * 0.001 = 0.12
+    #
+    # Realized PnL:
+    #   120 - 0.12 - 100.10 = 19.78
+
+    assert realized == pytest.approx(19.78)
 
     position = portfolio.position("BTCUSDT")
 
     assert position is not None
     assert position.quantity == pytest.approx(1.0)
+    assert position.cost_basis == pytest.approx(100.10)
+
+    snapshot = portfolio.snapshot()
+
+    assert snapshot.realized_pnl == pytest.approx(19.78)
+    assert snapshot.total_fees == pytest.approx(0.32)
+    assert snapshot.cash == pytest.approx(919.88)
 
 
 # ---------------------------------------------------------------------------
