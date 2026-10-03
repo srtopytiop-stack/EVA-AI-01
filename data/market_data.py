@@ -29,7 +29,7 @@ from typing import Any
 import requests
 
 
-BINANCE_SPOT_BASE_URL = "https://api.binance.com"
+BINANCE_SPOT_BASE_URL = "https://data-api.binance.vision"
 
 KLINES_ENDPOINT = "/api/v3/klines"
 
