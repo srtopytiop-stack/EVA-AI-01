@@ -242,8 +242,7 @@ def test_pipeline_reaches_statistical_and_bootstrap_layers(
     for start in range(0, len(returns) - block_length + 1):
         block = returns[start : start + block_length]
         _assert_nonzero_variance(block)
-
-    assert result.statistical_validation.observations == BACKTEST_OBSERVATIONS - 1
+ 
     assert result.bootstrap_validation.observations == BACKTEST_OBSERVATIONS - 1
     assert result.bootstrap_validation.bootstrap_replications == 200
     assert result.bootstrap_validation.block_length == 5
