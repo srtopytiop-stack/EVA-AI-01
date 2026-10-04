@@ -4,7 +4,8 @@ EVA-AI-01 - Notification Layer
 Phase-15-B notification boundary.
 
 The formatter is always available and has no side effects.
-Telegram delivery is explicitly opt-in through TELEGRAM_ENABLED=true.
+Telegram delivery is explicitly opt-in through TELEGRAM_ENABLED=true and is
+allowed only when Phase-15-B is release-ready.
 
 Safety
 ------
@@ -12,6 +13,7 @@ Safety
 - No live orders are placed.
 - No Binance trading credentials are accepted.
 - Telegram is disabled by default.
+- A failed statistical validation is reported honestly; no metric is invented.
 """
 
 from __future__ import annotations
@@ -88,6 +90,11 @@ def _parse_bool(name: str, default: bool = False) -> bool:
     )
 
 
+def _safe_attr(obj: object, name: str, default: object = None) -> object:
+    """Read an optional field from real or test-double research objects."""
+    return getattr(obj, name, default)
+
+
 def format_phase15b_message(result: Phase15BResult) -> str:
     """Create a concise, auditable Telegram message from Phase-15-B output."""
 
@@ -115,31 +122,65 @@ def format_phase15b_message(result: Phase15BResult) -> str:
         f"Rejected actions: {metrics.rejected_actions}",
         "",
         "Statistical validation",
-        f"Periodic Sharpe: {stats.periodic_sharpe:.6f}",
-        f"Probabilistic Sharpe: {stats.probabilistic_sharpe:.6f}",
-        f"Deflated Sharpe: {stats.deflated_sharpe:.6f}",
-        "",
-        "Moving-block bootstrap",
-        f"Observations: {bootstrap.observations}",
-        f"Replications: {bootstrap.bootstrap_replications}",
-        f"Block length: {bootstrap.block_length}",
-        (
-            "Sharpe CI: "
-            f"[{bootstrap.sharpe_ci_lower:.6f}, "
-            f"{bootstrap.sharpe_ci_upper:.6f}]"
-        ),
-        (
-            "Positive Sharpe fraction: "
-            f"{bootstrap.bootstrap_positive_sharpe_fraction:.4f}"
-        ),
     ]
+
+    if stats is None:
+        lines.append("Status: INSUFFICIENT_DATA")
+        reason = _safe_attr(
+            research,
+            "statistical_validation_error",
+            None,
+        )
+        if reason:
+            lines.append(f"Reason: {reason}")
+    else:
+        lines.extend(
+            [
+                f"Periodic Sharpe: {stats.periodic_sharpe:.6f}",
+                f"Probabilistic Sharpe: {stats.probabilistic_sharpe:.6f}",
+                f"Deflated Sharpe: {stats.deflated_sharpe:.6f}",
+            ]
+        )
+
+    lines.append("")
+    lines.append("Moving-block bootstrap")
+
+    if bootstrap is None:
+        lines.append("Status: INSUFFICIENT_DATA")
+        reason = _safe_attr(
+            research,
+            "bootstrap_validation_error",
+            None,
+        )
+        if reason:
+            lines.append(f"Reason: {reason}")
+    else:
+        lines.extend(
+            [
+                f"Observations: {bootstrap.observations}",
+                f"Replications: {bootstrap.bootstrap_replications}",
+                f"Block length: {bootstrap.block_length}",
+                (
+                    "Sharpe CI: "
+                    f"[{bootstrap.sharpe_ci_lower:.6f}, "
+                    f"{bootstrap.sharpe_ci_upper:.6f}]"
+                ),
+                (
+                    "Positive Sharpe fraction: "
+                    f"{bootstrap.bootstrap_positive_sharpe_fraction:.4f}"
+                ),
+            ]
+        )
 
     if result.production_gate.critical_failures:
         lines.extend(
             [
                 "",
                 "Production Gate failures:",
-                *[f"- {failure}" for failure in result.production_gate.critical_failures],
+                *[
+                    f"- {failure}"
+                    for failure in result.production_gate.critical_failures
+                ],
             ]
         )
 
@@ -189,7 +230,7 @@ class TelegramNotifier:
         self.session = session or requests.Session()
 
     def send(self, result: Phase15BResult) -> NotificationResult:
-        """Send a Phase-15-B report when Telegram is explicitly enabled."""
+        """Send a Phase-15-B report only when the release gate is ready."""
 
         message = format_phase15b_message(result)
 
@@ -199,6 +240,17 @@ class TelegramNotifier:
                 sent=False,
                 skipped=True,
                 message="Telegram notifications are disabled",
+            )
+
+        # Notification is a release/diagnostic boundary, not a bypass around
+        # Production Gate or Monitoring. A blocked result remains available to
+        # logs/UI, but is not pushed as a normal ready notification.
+        if not result.release_ready:
+            return NotificationResult(
+                enabled=True,
+                sent=False,
+                skipped=True,
+                message="Telegram skipped: Phase-15-B is not release-ready",
             )
 
         if not self.config.bot_token or not self.config.chat_id:
