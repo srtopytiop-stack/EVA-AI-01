@@ -53,8 +53,10 @@ class Research:
     interval: str = "1m"
     candle_count: int = 40
     backtest: Backtest = Backtest()
-    statistical_validation: Statistical = Statistical()
-    bootstrap_validation: Bootstrap = Bootstrap()
+    statistical_validation: Statistical | None = Statistical()
+    bootstrap_validation: Bootstrap | None = Bootstrap()
+    statistical_validation_error: str | None = None
+    bootstrap_validation_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,10 +84,11 @@ class Result:
     production_gate: Gate = Gate()
     monitoring: Monitoring = Monitoring()
     status: Phase15BStatus = Phase15BStatus.READY
+    ready: bool = True
 
     @property
     def release_ready(self) -> bool:
-        return True
+        return self.ready
 
 
 def test_formatter_contains_core_metrics() -> None:
@@ -98,12 +101,54 @@ def test_formatter_contains_core_metrics() -> None:
     assert "No live order was placed" in message
 
 
+def test_formatter_reports_undefined_validation_without_fabricating_values() -> None:
+    research = Research(
+        statistical_validation=None,
+        bootstrap_validation=None,
+        statistical_validation_error="return variance is zero; Sharpe inference is undefined",
+        bootstrap_validation_error="backtest_result.equity_curve failed statistical validation",
+    )
+    result = Result(
+        research=research,
+        production_gate=Gate(
+            approved=False,
+            critical_failures=(
+                "statistical_validation: statistical validation report is missing",
+            ),
+        ),
+        ready=False,
+        status=Phase15BStatus.GATE_BLOCKED,
+    )
+
+    message = format_phase15b_message(result)
+
+    assert "Status: INSUFFICIENT_DATA" in message
+    assert "return variance is zero" in message
+    assert "backtest_result.equity_curve failed statistical validation" in message
+    assert "Periodic Sharpe:" not in message
+
+
 def test_disabled_telegram_is_skipped() -> None:
     notifier = TelegramNotifier(TelegramConfig(enabled=False))
     outcome = notifier.send(Result())
 
     assert outcome.skipped is True
     assert outcome.sent is False
+
+
+def test_blocked_phase15b_is_not_sent_to_telegram() -> None:
+    notifier = TelegramNotifier(
+        TelegramConfig(
+            enabled=True,
+            bot_token="token",
+            chat_id="chat",
+        )
+    )
+    outcome = notifier.send(Result(ready=False))
+
+    assert outcome.skipped is True
+    assert outcome.sent is False
+    assert "not release-ready" in outcome.message
 
 
 def test_enabled_telegram_requires_credentials(
