@@ -1,18 +1,22 @@
 """
 EVA-AI-01 - System Integration Layer
 ====================================
-Phase 14-A preparation.
+Phase 14-A / Phase 15-B research integration boundary.
 
-Orchestrates the completed research components without modifying the stable
-engines:
+The integration layer is responsible for composing the completed research
+components without changing their individual scientific contracts.
 
-MarketDataResult -> FeatureEngine -> BacktestEngine -> Statistical Validation
-                  -> Moving-Block Bootstrap Validation
+Important behavior for a degenerate backtest
+---------------------------------------------
+A flat equity curve is a real research result: it means the backtest did not
+produce a variable return series. Sharpe/PSR/DSR inference is therefore
+undefined. That condition must not crash the whole analysis runtime, but it
+also must never be converted into a fabricated numeric statistic.
 
-Feature output is retained as an auditable research artifact. It is not
-silently injected into SignalEngine because SignalEngine's current public
-contract consumes OHLCV history directly. Changing that contract is a
-separate architectural decision.
+Accordingly, statistical and bootstrap validation are optional *outputs* of
+this boundary. When inference is undefined, the completed backtest and all
+its diagnostics are preserved, the validation error is recorded, and the
+Production Gate remains responsible for blocking release.
 
 This module is offline/research-only. It does not place live orders, use
 Binance credentials, or send Telegram messages.
@@ -29,10 +33,14 @@ from core.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
 from core.backtest_validation import validate_backtest_result
 from core.bootstrap_validation import (
     MIN_BOOTSTRAP_REPLICATIONS,
+    BootstrapValidationError,
     BootstrapValidationReport,
     validate_backtest_result_with_bootstrap,
 )
-from core.statistical_validation import StatisticalValidationReport
+from core.statistical_validation import (
+    StatisticalValidationError,
+    StatisticalValidationReport,
+)
 from data.market_data import Candle, MarketDataResult
 from features.feature_engine import (
     FeatureConfig,
@@ -97,8 +105,6 @@ class IntegrationConfig:
         ):
             raise IntegrationError("bootstrap_seed must be an integer or None")
 
-        # Keep explicit local bindings so validation is not accidentally
-        # optimized away and to document the boundary values.
         _ = benchmark
 
 
@@ -116,7 +122,13 @@ def _finite_number(value: object, name: str) -> float:
 
 @dataclass(frozen=True)
 class IntegrationResult:
-    """Immutable summary of one complete integrated research run."""
+    """Immutable summary of one integrated research run.
+
+    ``statistical_validation`` and ``bootstrap_validation`` are optional
+    because inference can be mathematically undefined for a completed
+    backtest (for example, a zero-variance return series). ``None`` here is
+    explicit missing evidence, never a fabricated statistic.
+    """
 
     symbol: str
     interval: str
@@ -124,12 +136,22 @@ class IntegrationResult:
     feature_rows: int
     feature_columns: tuple[str, ...]
     backtest: BacktestResult
-    statistical_validation: StatisticalValidationReport
-    bootstrap_validation: BootstrapValidationReport
+    statistical_validation: StatisticalValidationReport | None
+    bootstrap_validation: BootstrapValidationReport | None
+    statistical_validation_error: str | None = None
+    bootstrap_validation_error: str | None = None
 
     @property
     def final_equity(self) -> float:
         return float(self.backtest.metrics.final_equity)
+
+    @property
+    def validation_complete(self) -> bool:
+        """Whether both inference layers produced valid reports."""
+        return (
+            self.statistical_validation is not None
+            and self.bootstrap_validation is not None
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -139,8 +161,19 @@ class IntegrationResult:
             "feature_rows": self.feature_rows,
             "feature_columns": list(self.feature_columns),
             "backtest": self.backtest.to_dict(),
-            "statistical_validation": self.statistical_validation.to_dict(),
-            "bootstrap_validation": self.bootstrap_validation.to_dict(),
+            "statistical_validation": (
+                self.statistical_validation.to_dict()
+                if self.statistical_validation is not None
+                else None
+            ),
+            "bootstrap_validation": (
+                self.bootstrap_validation.to_dict()
+                if self.bootstrap_validation is not None
+                else None
+            ),
+            "statistical_validation_error": self.statistical_validation_error,
+            "bootstrap_validation_error": self.bootstrap_validation_error,
+            "validation_complete": self.validation_complete,
             "final_equity": self.final_equity,
         }
 
@@ -200,7 +233,13 @@ def run_integrated_research(
     *,
     config: IntegrationConfig | None = None,
 ) -> IntegrationResult:
-    """Run the complete offline integration pipeline."""
+    """Run the complete offline integration pipeline.
+
+    A completed backtest is always preserved. Statistical inference is
+    fail-soft only at this orchestration boundary: domain-specific inference
+    errors are recorded and passed downstream to the Gate/Monitoring layers.
+    No invalid statistic is manufactured and no gate is bypassed.
+    """
     cfg = config or IntegrationConfig()
     symbol, interval, candles = _validate_market_data_result(market_data)
 
@@ -217,7 +256,7 @@ def run_integrated_research(
 
     columns = tuple(feature_columns(generated))
 
-    # 2. Backtest layer: the existing event-driven engine remains authoritative.
+    # 2. Backtest layer: existing event-driven engine remains authoritative.
     try:
         backtest = BacktestEngine(cfg.backtest_config).run(
             candles,
@@ -227,18 +266,22 @@ def run_integrated_research(
         raise IntegrationError(f"backtest integration failed: {exc}") from exc
 
     # 3. Statistical validation: post-backtest only.
+    statistical: StatisticalValidationReport | None = None
+    statistical_error: str | None = None
     try:
         statistical = validate_backtest_result(
             backtest,
             number_of_trials=cfg.number_of_trials,
             benchmark_sharpe=cfg.benchmark_sharpe,
         )
-    except Exception as exc:
-        raise IntegrationError(
-            f"statistical-validation integration failed: {exc}"
-        ) from exc
+    except StatisticalValidationError as exc:
+        # A mathematically undefined inference result is not a pipeline crash.
+        # Preserve the evidence and let the Production Gate block release.
+        statistical_error = str(exc)
 
     # 4. Dependence-aware bootstrap: consumes only the completed equity curve.
+    bootstrap: BootstrapValidationReport | None = None
+    bootstrap_error: str | None = None
     try:
         bootstrap = validate_backtest_result_with_bootstrap(
             backtest,
@@ -247,10 +290,9 @@ def run_integrated_research(
             seed=cfg.bootstrap_seed,
             risk_free_per_period=cfg.risk_free_per_period,
         )
-    except Exception as exc:
-        raise IntegrationError(
-            f"bootstrap-validation integration failed: {exc}"
-        ) from exc
+    except BootstrapValidationError as exc:
+        # Same fail-soft rule: no fabricated confidence interval/statistic.
+        bootstrap_error = str(exc)
 
     return IntegrationResult(
         symbol=symbol,
@@ -261,6 +303,8 @@ def run_integrated_research(
         backtest=backtest,
         statistical_validation=statistical,
         bootstrap_validation=bootstrap,
+        statistical_validation_error=statistical_error,
+        bootstrap_validation_error=bootstrap_error,
     )
 
 
