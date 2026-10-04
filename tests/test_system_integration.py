@@ -1,15 +1,13 @@
-"""Phase 14-A integration tests for EVA-AI-01.
+"""Phase 14-A / 15-B integration tests for EVA-AI-01.
 
 The integration boundary is tested in two parts:
 - MarketDataResult -> FeatureEngine is exercised for real.
 - BacktestResult -> Statistical Validation -> Bootstrap Validation is exercised
-  with a deterministic BacktestResult fixture.
+  with deterministic fixtures.
 
-The BacktestEngine itself has its own dedicated test suite. Mocking its output
-here is intentional: this test is specifically designed to prove that the
-system-integration layer can consume a valid, non-degenerate backtest result
-and reach both statistical-validation layers without making production code
-more permissive around undefined Sharpe inference.
+The degenerate-backtest test proves the new fail-soft boundary: undefined
+inference is preserved as missing evidence instead of crashing the analysis
+runtime or fabricating a Sharpe statistic.
 """
 
 from __future__ import annotations
@@ -20,6 +18,7 @@ import pytest
 
 from core.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
 from core.backtest_metrics import EquityPoint, calculate_metrics
+from core.phase15b_runtime import diagnose_integrated_result
 from core.system_integration import (
     IntegrationConfig,
     IntegrationError,
@@ -40,8 +39,6 @@ def _market_data(count: int = BACKTEST_OBSERVATIONS) -> MarketDataResult:
     price = 30_000.0
 
     for i in range(count):
-        # The market fixture is deliberately non-flat, but the statistical
-        # test below does not depend on the strategy discovering trades from it.
         cycle = i % 10
         change = 0.0015 if cycle < 5 else -0.0010
 
@@ -98,13 +95,7 @@ def _synthetic_backtest_result(
     symbol: str,
     observations: int = BACKTEST_OBSERVATIONS,
 ) -> BacktestResult:
-    """Build a valid BacktestResult whose returns have guaranteed variance.
-
-    The five-period return motif is intentionally non-constant. Every possible
-    moving block of length five therefore contains multiple return values, so
-    the bootstrap layer cannot receive a constant block and hit its
-    ``return variance is zero`` guard.
-    """
+    """Build a valid BacktestResult whose returns have guaranteed variance."""
     return_pattern = (
         0.0040,
         -0.0020,
@@ -149,6 +140,46 @@ def _synthetic_backtest_result(
         warmup_bars=120,
         rejected_actions=0,
         equity_curve=equity_curve,
+        trades=(),
+        events=(),
+        metrics=metrics,
+        final_position_open=False,
+    )
+
+
+def _flat_backtest_result(
+    *,
+    symbol: str,
+    observations: int = BACKTEST_OBSERVATIONS,
+) -> BacktestResult:
+    """Build a valid backtest whose periodic returns are identically zero."""
+    equity_points = tuple(
+        EquityPoint(
+            timestamp=START_TIMESTAMP_MS + i * CANDLE_INTERVAL_MS,
+            equity=INITIAL_EQUITY,
+            cash=INITIAL_EQUITY,
+            gross_exposure=0.0,
+            exposure_pct=0.0,
+            drawdown_pct=0.0,
+        )
+        for i in range(observations)
+    )
+
+    metrics = calculate_metrics(
+        equity_curve=equity_points,
+        trades=(),
+        initial_equity=INITIAL_EQUITY,
+        benchmark_return=0.0,
+        rejected_actions=0,
+        risk_free_rate_annual=0.0,
+    )
+
+    return BacktestResult(
+        symbol=symbol,
+        bars_processed=observations,
+        warmup_bars=120,
+        rejected_actions=0,
+        equity_curve=equity_points,
         trades=(),
         events=(),
         metrics=metrics,
@@ -202,7 +233,6 @@ def test_pipeline_reaches_statistical_and_bootstrap_layers(
 
     result = run_integrated_research(market, config=_config())
 
-    # Prove the integration layer invoked the BacktestEngine contract.
     assert calls == {
         "symbol": "BTCUSDT",
         "candle_count": BACKTEST_OBSERVATIONS,
@@ -232,29 +262,62 @@ def test_pipeline_reaches_statistical_and_bootstrap_layers(
         )
     ]
 
-    # This is the exact invariant required by statistical Sharpe inference.
     _assert_nonzero_variance(returns)
 
-    # The moving-block bootstrap uses block_length=5. The fixture repeats a
-    # five-return motif containing multiple values, so every possible moving
-    # block has non-zero variance before blocks are sampled with replacement.
     block_length = _config().bootstrap_block_length
     for start in range(0, len(returns) - block_length + 1):
         block = returns[start : start + block_length]
         _assert_nonzero_variance(block)
- 
+
+    assert result.bootstrap_validation is not None
     assert result.bootstrap_validation.observations == BACKTEST_OBSERVATIONS - 1
     assert result.bootstrap_validation.bootstrap_replications == 200
     assert result.bootstrap_validation.block_length == 5
 
+    assert result.statistical_validation is not None
     assert isfinite(result.statistical_validation.periodic_sharpe)
     assert isfinite(result.statistical_validation.probabilistic_sharpe)
     assert isfinite(result.statistical_validation.deflated_sharpe)
     assert isfinite(result.bootstrap_validation.observed_periodic_sharpe)
+    assert result.validation_complete is True
 
     payload = result.to_dict()
     assert payload["symbol"] == "BTCUSDT"
     assert payload["final_equity"] == result.final_equity
+    assert payload["validation_complete"] is True
 
     with pytest.raises(AttributeError):
         result.candle_count = 999  # type: ignore[misc]
+
+
+def test_degenerate_backtest_is_preserved_without_fabricating_statistics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    market = _market_data()
+
+    monkeypatch.setattr(
+        BacktestEngine,
+        "run",
+        lambda self, candles, *, symbol: _flat_backtest_result(symbol=symbol),
+    )
+
+    result = run_integrated_research(market, config=_config())
+
+    assert result.backtest.metrics.final_equity == INITIAL_EQUITY
+    assert result.statistical_validation is None
+    assert result.bootstrap_validation is None
+    assert result.validation_complete is False
+    assert result.statistical_validation_error is not None
+    assert "return variance is zero" in result.statistical_validation_error
+    assert result.bootstrap_validation_error is not None
+
+    payload = result.to_dict()
+    assert payload["statistical_validation"] is None
+    assert payload["bootstrap_validation"] is None
+    assert payload["validation_complete"] is False
+
+    # The result remains diagnosable by Phase-15-B; release readiness is still
+    # false because undefined inference is correctly treated as blocking.
+    phase15b = diagnose_integrated_result(result)
+    assert phase15b.release_ready is False
+    assert phase15b.production_gate.approved is False
