@@ -192,3 +192,14 @@ def test_invalid_backtest_result_is_rejected() -> None:
             bootstrap_replications=250,
             block_length=4,
         )
+def test_zero_variance_returns_are_rejected_as_bootstrap_error() -> None:
+    """Bootstrap must translate undefined Sharpe inference to its own error."""
+    with pytest.raises(BootstrapValidationError) as exc_info:
+        validate_returns_with_moving_block_bootstrap(
+            [0.0] * 64,
+            bootstrap_replications=250,
+            block_length=4,
+            seed=42,
+        )
+
+    assert "return variance is zero" in str(exc_info.value)
