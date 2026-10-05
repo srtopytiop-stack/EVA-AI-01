@@ -34,12 +34,17 @@ def make_returns() -> list[float]:
         0.005,
         -0.002,
     )
-    return [pattern[index % len(pattern)] for index in range(64)]
+
+    return [
+        pattern[index % len(pattern)]
+        for index in range(64)
+    ]
 
 
 def make_backtest_result() -> MockBacktestResult:
     returns = make_returns()
     equity = 1_000.0
+
     points = [
         EquityPoint(
             timestamp=1_800_000_000_000,
@@ -51,11 +56,18 @@ def make_backtest_result() -> MockBacktestResult:
         )
     ]
 
-    for index, value in enumerate(returns, start=1):
+    for index, value in enumerate(
+        returns,
+        start=1,
+    ):
         equity *= 1.0 + value
+
         points.append(
             EquityPoint(
-                timestamp=1_800_000_000_000 + index * 60_000,
+                timestamp=(
+                    1_800_000_000_000
+                    + index * 60_000
+                ),
                 equity=equity,
                 cash=equity,
                 gross_exposure=0.0,
@@ -64,7 +76,10 @@ def make_backtest_result() -> MockBacktestResult:
             )
         )
 
-    return MockBacktestResult(equity_curve=tuple(points), trades=(object(),))
+    return MockBacktestResult(
+        equity_curve=tuple(points),
+        trades=(object(),),
+    )
 
 
 def test_bootstrap_is_reproducible_for_same_seed() -> None:
@@ -76,6 +91,7 @@ def test_bootstrap_is_reproducible_for_same_seed() -> None:
         block_length=4,
         seed=123,
     )
+
     second = validate_returns_with_moving_block_bootstrap(
         returns,
         bootstrap_replications=250,
@@ -99,14 +115,28 @@ def test_bootstrap_preserves_observed_statistics_separately_from_resamples() -> 
     from core.statistical_validation import periodic_sharpe_ratio
 
     assert report.observations == len(returns)
+
     assert report.observed_periodic_sharpe == pytest.approx(
         periodic_sharpe_ratio(returns)
     )
+
     assert report.bootstrap_replications == 250
-    assert 0.0 <= report.bootstrap_positive_sharpe_fraction <= 1.0
+
+    assert (
+        0.0
+        <= report.bootstrap_positive_sharpe_fraction
+        <= 1.0
+    )
+
     assert report.sharpe_ci_lower <= report.sharpe_ci_upper
-    assert report.total_return_ci_lower <= report.total_return_ci_upper
-    assert report.max_drawdown_ci_lower <= report.max_drawdown_ci_upper
+    assert (
+        report.total_return_ci_lower
+        <= report.total_return_ci_upper
+    )
+    assert (
+        report.max_drawdown_ci_lower
+        <= report.max_drawdown_ci_upper
+    )
 
 
 def test_bootstrap_does_not_use_trade_count_as_research_trial_count() -> None:
@@ -120,7 +150,9 @@ def test_bootstrap_does_not_use_trade_count_as_research_trial_count() -> None:
     )
 
     assert report.bootstrap_replications == 250
-    assert result.trades == (result.trades[0],)
+    assert result.trades == (
+        result.trades[0],
+    )
 
 
 def test_backtest_result_bridge_uses_only_equity_curve() -> None:
@@ -134,7 +166,11 @@ def test_backtest_result_bridge_uses_only_equity_curve() -> None:
         seed=42,
     )
 
-    assert report.observations == len(result.equity_curve) - 1
+    assert (
+        report.observations
+        == len(result.equity_curve) - 1
+    )
+
     assert tuple(result.equity_curve) == before
 
 
@@ -146,7 +182,10 @@ def test_report_is_json_safe() -> None:
         seed=42,
     )
 
-    json.dumps(report.to_dict(), allow_nan=False)
+    json.dumps(
+        report.to_dict(),
+        allow_nan=False,
+    )
 
 
 def test_invalid_replication_count_is_rejected() -> None:
@@ -192,9 +231,16 @@ def test_invalid_backtest_result_is_rejected() -> None:
             bootstrap_replications=250,
             block_length=4,
         )
+
+
 def test_zero_variance_returns_are_rejected_as_bootstrap_error() -> None:
-    """Bootstrap must translate undefined Sharpe inference to its own error."""
-    with pytest.raises(BootstrapValidationError) as exc_info:
+    """
+    Bootstrap must translate undefined Sharpe inference
+    into its own domain-specific error.
+    """
+    with pytest.raises(
+        BootstrapValidationError
+    ) as exc_info:
         validate_returns_with_moving_block_bootstrap(
             [0.0] * 64,
             bootstrap_replications=250,
@@ -202,4 +248,7 @@ def test_zero_variance_returns_are_rejected_as_bootstrap_error() -> None:
             seed=42,
         )
 
-    assert "return variance is zero" in str(exc_info.value)
+    assert (
+        "return variance is zero"
+        in str(exc_info.value)
+    )
