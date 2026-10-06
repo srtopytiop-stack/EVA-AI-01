@@ -3,15 +3,7 @@ EVA-AI-01 - Notification Layer
 ===============================
 Phase-15-B notification boundary.
 
-The formatter is always available and has no side effects.
-Telegram delivery is explicitly opt-in through TELEGRAM_ENABLED=true.
-
-Important
----------
 Telegram is an analysis/diagnostic notification channel only.
-
-A blocked Production Gate does NOT prevent EVA from reporting its
-research result. The Gate status is included honestly in the message.
 
 Safety
 ------
@@ -21,7 +13,7 @@ Safety
 - Telegram is disabled by default.
 - Telegram never changes release_ready.
 - Telegram never bypasses Production Gate.
-- Telegram only reports already-computed research results.
+- Blocked research reports require explicit opt-in.
 - Failed statistical validation is reported honestly.
 - No metric is invented or fabricated.
 """
@@ -49,6 +41,16 @@ class TelegramConfig:
     chat_id: str | None = None
     timeout_seconds: float = 10.0
 
+    # When False, blocked Phase-15-B results are not sent.
+    # This preserves the conservative default and existing tests.
+    #
+    # Railway can explicitly set:
+    # TELEGRAM_SEND_BLOCKED_RESULTS=true
+    #
+    # This allows EVA to send research/diagnostic reports while still
+    # keeping the Production Gate blocked.
+    send_blocked_results: bool = False
+
     @classmethod
     def from_environment(cls) -> "TelegramConfig":
         enabled = _parse_bool("TELEGRAM_ENABLED", False)
@@ -63,6 +65,11 @@ class TelegramConfig:
             or _env_optional("ADMIN_ID")
         )
 
+        send_blocked_results = _parse_bool(
+            "TELEGRAM_SEND_BLOCKED_RESULTS",
+            False,
+        )
+
         if enabled and (not token or not chat_id):
             raise NotificationError(
                 "TELEGRAM_ENABLED=true requires "
@@ -74,6 +81,7 @@ class TelegramConfig:
             enabled=enabled,
             bot_token=token,
             chat_id=chat_id,
+            send_blocked_results=send_blocked_results,
         )
 
 
@@ -130,8 +138,8 @@ def format_phase15b_message(result: Phase15BResult) -> str:
     """
     Create a concise and auditable Telegram research report.
 
-    The message reports the Production Gate state but does not allow
-    that state to suppress the research notification.
+    The Production Gate status is reported honestly.
+    Telegram does not alter the gate result.
     """
 
     research = result.research
@@ -264,13 +272,12 @@ def format_phase15b_message(result: Phase15BResult) -> str:
             ]
         )
 
-    # Explicitly distinguish analysis from trading readiness.
     if result.release_ready:
         lines.extend(
             [
                 "",
                 "Gate status: RELEASE-READY",
-                "This report passed the current release gate.",
+                "The current release gate passed.",
             ]
         )
     else:
@@ -279,8 +286,8 @@ def format_phase15b_message(result: Phase15BResult) -> str:
                 "",
                 "Gate status: BLOCKED",
                 (
-                    "Research was reported for diagnostics. "
-                    "The blocked gate was NOT bypassed."
+                    "This report is diagnostic only. "
+                    "The Production Gate was not bypassed."
                 ),
             ]
         )
@@ -301,7 +308,7 @@ class TelegramNotifier:
     """
     Opt-in Telegram transport for already-computed research reports.
 
-    This class does NOT make trading decisions and does NOT bypass
+    This class does not make trading decisions and does not bypass
     Production Gate or Monitoring.
     """
 
@@ -318,10 +325,20 @@ class TelegramNotifier:
 
     def send(self, result: Phase15BResult) -> NotificationResult:
         """
-        Send the Phase-15-B research report.
+        Send a Phase-15-B research report.
 
-        A blocked release gate is reported rather than silently suppressing
-        the analysis. Telegram is informational only.
+        Normal behavior:
+            release_ready=True  -> send
+
+        Conservative behavior:
+            release_ready=False -> skip
+
+        Analysis-only Railway behavior:
+            TELEGRAM_SEND_BLOCKED_RESULTS=true
+            -> send blocked diagnostic report
+
+        Importantly, sending a blocked report does not modify the
+        Production Gate and does not execute any trading action.
         """
 
         message = format_phase15b_message(result)
@@ -333,6 +350,18 @@ class TelegramNotifier:
                 skipped=True,
                 message="Telegram notifications are disabled",
             )
+
+        if not result.release_ready:
+            if not self.config.send_blocked_results:
+                return NotificationResult(
+                    enabled=True,
+                    sent=False,
+                    skipped=True,
+                    message=(
+                        "Telegram skipped: Phase-15-B is not "
+                        "release-ready"
+                    ),
+                )
 
         if not self.config.bot_token or not self.config.chat_id:
             raise NotificationError(
@@ -382,11 +411,19 @@ class TelegramNotifier:
                 f"Telegram rejected the message: {body!r}"
             )
 
+        if result.release_ready:
+            message_result = "Telegram notification sent"
+        else:
+            message_result = (
+                "Telegram diagnostic notification sent "
+                "for blocked Phase-15-B result"
+            )
+
         return NotificationResult(
             enabled=True,
             sent=True,
             skipped=False,
-            message="Telegram notification sent",
+            message=message_result,
         )
 
 
