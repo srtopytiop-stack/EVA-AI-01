@@ -4,8 +4,14 @@ EVA-AI-01 - Notification Layer
 Phase-15-B notification boundary.
 
 The formatter is always available and has no side effects.
-Telegram delivery is explicitly opt-in through TELEGRAM_ENABLED=true and is
-allowed only when Phase-15-B is release-ready.
+Telegram delivery is explicitly opt-in through TELEGRAM_ENABLED=true.
+
+Important
+---------
+Telegram is an analysis/diagnostic notification channel only.
+
+A blocked Production Gate does NOT prevent EVA from reporting its
+research result. The Gate status is included honestly in the message.
 
 Safety
 ------
@@ -13,7 +19,11 @@ Safety
 - No live orders are placed.
 - No Binance trading credentials are accepted.
 - Telegram is disabled by default.
-- A failed statistical validation is reported honestly; no metric is invented.
+- Telegram never changes release_ready.
+- Telegram never bypasses Production Gate.
+- Telegram only reports already-computed research results.
+- Failed statistical validation is reported honestly.
+- No metric is invented or fabricated.
 """
 
 from __future__ import annotations
@@ -42,12 +52,22 @@ class TelegramConfig:
     @classmethod
     def from_environment(cls) -> "TelegramConfig":
         enabled = _parse_bool("TELEGRAM_ENABLED", False)
-        token = _env_optional("TELEGRAM_BOT_TOKEN") or _env_optional("BOT_TOKEN")
-        chat_id = _env_optional("TELEGRAM_CHAT_ID") or _env_optional("ADMIN_ID")
+
+        token = (
+            _env_optional("TELEGRAM_BOT_TOKEN")
+            or _env_optional("BOT_TOKEN")
+        )
+
+        chat_id = (
+            _env_optional("TELEGRAM_CHAT_ID")
+            or _env_optional("ADMIN_ID")
+        )
 
         if enabled and (not token or not chat_id):
             raise NotificationError(
-                "TELEGRAM_ENABLED=true requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID"
+                "TELEGRAM_ENABLED=true requires "
+                "TELEGRAM_BOT_TOKEN or BOT_TOKEN, and "
+                "TELEGRAM_CHAT_ID or ADMIN_ID"
             )
 
         return cls(
@@ -68,20 +88,27 @@ class NotificationResult:
 
 
 def _env_optional(name: str) -> str | None:
+    """Return a stripped environment variable or None."""
     value = os.getenv(name)
+
     if value is None or not value.strip():
         return None
+
     return value.strip()
 
 
 def _parse_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable safely."""
     raw = os.getenv(name)
+
     if raw is None or not raw.strip():
         return default
 
     normalized = raw.strip().lower()
+
     if normalized in {"1", "true", "yes", "on"}:
         return True
+
     if normalized in {"0", "false", "no", "off"}:
         return False
 
@@ -90,13 +117,22 @@ def _parse_bool(name: str, default: bool = False) -> bool:
     )
 
 
-def _safe_attr(obj: object, name: str, default: object = None) -> object:
-    """Read an optional field from real or test-double research objects."""
+def _safe_attr(
+    obj: object,
+    name: str,
+    default: object = None,
+) -> object:
+    """Read an optional field from real or test-double objects."""
     return getattr(obj, name, default)
 
 
 def format_phase15b_message(result: Phase15BResult) -> str:
-    """Create a concise, auditable Telegram message from Phase-15-B output."""
+    """
+    Create a concise and auditable Telegram research report.
+
+    The message reports the Production Gate state but does not allow
+    that state to suppress the research notification.
+    """
 
     research = result.research
     backtest = research.backtest
@@ -126,19 +162,28 @@ def format_phase15b_message(result: Phase15BResult) -> str:
 
     if stats is None:
         lines.append("Status: INSUFFICIENT_DATA")
+
         reason = _safe_attr(
             research,
             "statistical_validation_error",
             None,
         )
+
         if reason:
             lines.append(f"Reason: {reason}")
+
     else:
         lines.extend(
             [
                 f"Periodic Sharpe: {stats.periodic_sharpe:.6f}",
-                f"Probabilistic Sharpe: {stats.probabilistic_sharpe:.6f}",
-                f"Deflated Sharpe: {stats.deflated_sharpe:.6f}",
+                (
+                    "Probabilistic Sharpe: "
+                    f"{stats.probabilistic_sharpe:.6f}"
+                ),
+                (
+                    "Deflated Sharpe: "
+                    f"{stats.deflated_sharpe:.6f}"
+                ),
             ]
         )
 
@@ -147,18 +192,24 @@ def format_phase15b_message(result: Phase15BResult) -> str:
 
     if bootstrap is None:
         lines.append("Status: INSUFFICIENT_DATA")
+
         reason = _safe_attr(
             research,
             "bootstrap_validation_error",
             None,
         )
+
         if reason:
             lines.append(f"Reason: {reason}")
+
     else:
         lines.extend(
             [
                 f"Observations: {bootstrap.observations}",
-                f"Replications: {bootstrap.bootstrap_replications}",
+                (
+                    "Replications: "
+                    f"{bootstrap.bootstrap_replications}"
+                ),
                 f"Block length: {bootstrap.block_length}",
                 (
                     "Sharpe CI: "
@@ -176,10 +227,11 @@ def format_phase15b_message(result: Phase15BResult) -> str:
         lines.extend(
             [
                 "",
-                "Production Gate failures:",
+                "Production Gate — CRITICAL FAILURES:",
                 *[
                     f"- {failure}"
-                    for failure in result.production_gate.critical_failures
+                    for failure
+                    in result.production_gate.critical_failures
                 ],
             ]
         )
@@ -188,8 +240,12 @@ def format_phase15b_message(result: Phase15BResult) -> str:
         lines.extend(
             [
                 "",
-                "Production Gate warnings:",
-                *[f"- {warning}" for warning in result.production_gate.warnings],
+                "Production Gate — WARNINGS:",
+                *[
+                    f"- {warning}"
+                    for warning
+                    in result.production_gate.warnings
+                ],
             ]
         )
 
@@ -199,16 +255,42 @@ def format_phase15b_message(result: Phase15BResult) -> str:
                 "",
                 "Monitoring issues:",
                 *[
-                    f"- [{issue.severity.value}] {issue.code}: {issue.message}"
+                    (
+                        f"- [{issue.severity.value}] "
+                        f"{issue.code}: {issue.message}"
+                    )
                     for issue in result.monitoring.issues
                 ],
+            ]
+        )
+
+    # Explicitly distinguish analysis from trading readiness.
+    if result.release_ready:
+        lines.extend(
+            [
+                "",
+                "Gate status: RELEASE-READY",
+                "This report passed the current release gate.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "Gate status: BLOCKED",
+                (
+                    "Research was reported for diagnostics. "
+                    "The blocked gate was NOT bypassed."
+                ),
             ]
         )
 
     lines.extend(
         [
             "",
-            "Safety: research/paper-only. No live order was placed.",
+            "Safety: analysis/research-only.",
+            "No live order was placed.",
+            "No trading action was executed by EVA-AI-01.",
         ]
     )
 
@@ -216,7 +298,12 @@ def format_phase15b_message(result: Phase15BResult) -> str:
 
 
 class TelegramNotifier:
-    """Opt-in Telegram transport for already-computed research reports."""
+    """
+    Opt-in Telegram transport for already-computed research reports.
+
+    This class does NOT make trading decisions and does NOT bypass
+    Production Gate or Monitoring.
+    """
 
     TELEGRAM_API = "https://api.telegram.org"
     MAX_MESSAGE_LENGTH = 4096
@@ -230,7 +317,12 @@ class TelegramNotifier:
         self.session = session or requests.Session()
 
     def send(self, result: Phase15BResult) -> NotificationResult:
-        """Send a Phase-15-B report only when the release gate is ready."""
+        """
+        Send the Phase-15-B research report.
+
+        A blocked release gate is reported rather than silently suppressing
+        the analysis. Telegram is informational only.
+        """
 
         message = format_phase15b_message(result)
 
@@ -242,21 +334,15 @@ class TelegramNotifier:
                 message="Telegram notifications are disabled",
             )
 
-        # Notification is a release/diagnostic boundary, not a bypass around
-        # Production Gate or Monitoring. A blocked result remains available to
-        # logs/UI, but is not pushed as a normal ready notification.
-        if not result.release_ready:
-            return NotificationResult(
-                enabled=True,
-                sent=False,
-                skipped=True,
-                message="Telegram skipped: Phase-15-B is not release-ready",
+        if not self.config.bot_token or not self.config.chat_id:
+            raise NotificationError(
+                "Telegram configuration is incomplete"
             )
 
-        if not self.config.bot_token or not self.config.chat_id:
-            raise NotificationError("Telegram configuration is incomplete")
-
-        url = f"{self.TELEGRAM_API}/bot{self.config.bot_token}/sendMessage"
+        url = (
+            f"{self.TELEGRAM_API}/bot"
+            f"{self.config.bot_token}/sendMessage"
+        )
 
         payload = {
             "chat_id": self.config.chat_id,
@@ -270,6 +356,7 @@ class TelegramNotifier:
                 json=payload,
                 timeout=self.config.timeout_seconds,
             )
+
         except requests.RequestException as exc:
             raise NotificationError(
                 f"Telegram request failed: {exc}"
@@ -278,16 +365,22 @@ class TelegramNotifier:
         if response.status_code != 200:
             raise NotificationError(
                 "Telegram returned HTTP "
-                f"{response.status_code}: {response.text[:300]}"
+                f"{response.status_code}: "
+                f"{response.text[:300]}"
             )
 
         try:
             body = response.json()
+
         except ValueError as exc:
-            raise NotificationError("Telegram returned invalid JSON") from exc
+            raise NotificationError(
+                "Telegram returned invalid JSON"
+            ) from exc
 
         if body.get("ok") is not True:
-            raise NotificationError(f"Telegram rejected the message: {body!r}")
+            raise NotificationError(
+                f"Telegram rejected the message: {body!r}"
+            )
 
         return NotificationResult(
             enabled=True,
