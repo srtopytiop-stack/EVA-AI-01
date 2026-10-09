@@ -3,23 +3,15 @@ EVA-AI-01 - System Integration Layer
 ====================================
 Phase 14-A / Phase 15-B research integration boundary.
 
-The integration layer is responsible for composing the completed research
-components without changing their individual scientific contracts.
+The integration layer composes the research components while preserving
+their individual contracts.
 
-Important behavior for a degenerate backtest
----------------------------------------------
-A flat equity curve is a real research result: it means the backtest did not
-produce a variable return series. Sharpe/PSR/DSR inference is therefore
-undefined. That condition must not crash the whole analysis runtime, but it
-also must never be converted into a fabricated numeric statistic.
+A flat equity curve is a valid research result. When statistical inference
+is undefined, the pipeline preserves the backtest and records the failure
+instead of manufacturing a statistic.
 
-Accordingly, statistical and bootstrap validation are optional *outputs* of
-this boundary. When inference is undefined, the completed backtest and all
-its diagnostics are preserved, the validation error is recorded, and the
-Production Gate remains responsible for blocking release.
-
-This module is offline/research-only. It does not place live orders, use
-Binance credentials, or send Telegram messages.
+This module is research-only. It does not place live orders, use Binance
+credentials, or send Telegram messages.
 """
 
 from __future__ import annotations
@@ -29,7 +21,11 @@ from math import isfinite
 
 import pandas as pd
 
-from core.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
+from core.backtest_engine import (
+    BacktestConfig,
+    BacktestEngine,
+    BacktestResult,
+)
 from core.backtest_validation import validate_backtest_result
 from core.bootstrap_validation import (
     MIN_BOOTSTRAP_REPLICATIONS,
@@ -73,15 +69,20 @@ class IntegrationConfig:
             or not isinstance(self.number_of_trials, int)
             or self.number_of_trials < 2
         ):
-            raise IntegrationError("number_of_trials must be an integer >= 2")
+            raise IntegrationError(
+                "number_of_trials must be an integer >= 2"
+            )
 
-        benchmark = _finite_number(self.benchmark_sharpe, "benchmark_sharpe")
+        _finite_number(self.benchmark_sharpe, "benchmark_sharpe")
+
         risk_free = _finite_number(
             self.risk_free_per_period,
             "risk_free_per_period",
         )
         if risk_free <= -1.0:
-            raise IntegrationError("risk_free_per_period must be > -1")
+            raise IntegrationError(
+                "risk_free_per_period must be > -1"
+            )
 
         if (
             isinstance(self.bootstrap_replications, bool)
@@ -89,7 +90,8 @@ class IntegrationConfig:
             or self.bootstrap_replications < MIN_BOOTSTRAP_REPLICATIONS
         ):
             raise IntegrationError(
-                f"bootstrap_replications must be >= {MIN_BOOTSTRAP_REPLICATIONS}"
+                "bootstrap_replications must be >= "
+                f"{MIN_BOOTSTRAP_REPLICATIONS}"
             )
 
         if (
@@ -97,26 +99,31 @@ class IntegrationConfig:
             or not isinstance(self.bootstrap_block_length, int)
             or self.bootstrap_block_length < 2
         ):
-            raise IntegrationError("bootstrap_block_length must be an integer >= 2")
+            raise IntegrationError(
+                "bootstrap_block_length must be an integer >= 2"
+            )
 
         if self.bootstrap_seed is not None and (
             isinstance(self.bootstrap_seed, bool)
             or not isinstance(self.bootstrap_seed, int)
         ):
-            raise IntegrationError("bootstrap_seed must be an integer or None")
-
-        _ = benchmark
+            raise IntegrationError(
+                "bootstrap_seed must be an integer or None"
+            )
 
 
 def _finite_number(value: object, name: str) -> float:
     if isinstance(value, bool):
         raise IntegrationError(f"{name} must be numeric")
+
     try:
         normalized = float(value)
     except (TypeError, ValueError) as exc:
         raise IntegrationError(f"{name} must be numeric") from exc
+
     if not isfinite(normalized):
         raise IntegrationError(f"{name} must be finite")
+
     return normalized
 
 
@@ -124,10 +131,9 @@ def _finite_number(value: object, name: str) -> float:
 class IntegrationResult:
     """Immutable summary of one integrated research run.
 
-    ``statistical_validation`` and ``bootstrap_validation`` are optional
-    because inference can be mathematically undefined for a completed
-    backtest (for example, a zero-variance return series). ``None`` here is
-    explicit missing evidence, never a fabricated statistic.
+    Statistical and bootstrap reports may be absent when inference is
+    mathematically undefined. Missing evidence is represented explicitly;
+    no statistic is fabricated.
     """
 
     symbol: str
@@ -147,7 +153,7 @@ class IntegrationResult:
 
     @property
     def validation_complete(self) -> bool:
-        """Whether both inference layers produced valid reports."""
+        """Whether both statistical inference layers produced reports."""
         return (
             self.statistical_validation is not None
             and self.bootstrap_validation is not None
@@ -171,58 +177,113 @@ class IntegrationResult:
                 if self.bootstrap_validation is not None
                 else None
             ),
-            "statistical_validation_error": self.statistical_validation_error,
-            "bootstrap_validation_error": self.bootstrap_validation_error,
+            "statistical_validation_error": (
+                self.statistical_validation_error
+            ),
+            "bootstrap_validation_error": (
+                self.bootstrap_validation_error
+            ),
             "validation_complete": self.validation_complete,
             "final_equity": self.final_equity,
         }
 
 
-def _candles_to_frame(candles: tuple[Candle, ...]) -> pd.DataFrame:
-    """Convert validated candles to FeatureEngine's OHLCV contract."""
+def _candles_to_frame(
+    candles: tuple[Candle, ...],
+) -> pd.DataFrame:
+    """Convert validated candles into FeatureEngine's OHLCV contract.
+
+    Candle timestamps use Unix milliseconds. The unit and timezone must be
+    explicit; otherwise an integer timestamp may be interpreted as
+    nanoseconds and silently produce an incorrect date near 1970.
+
+    The resulting timestamp represents the candle's opening time. It does
+    not imply that the completed candle's final OHLCV values were available
+    at that opening time.
+    """
+
+    timestamps = pd.to_datetime(
+        [candle.open_time for candle in candles],
+        unit="ms",
+        utc=True,
+        errors="raise",
+    )
+
     return pd.DataFrame(
-        [
-            {
-                "timestamp": candle.open_time,
-                "open": float(candle.open),
-                "high": float(candle.high),
-                "low": float(candle.low),
-                "close": float(candle.close),
-                "volume": float(candle.volume),
-            }
-            for candle in candles
+        {
+            "timestamp": timestamps,
+            "open": [float(candle.open) for candle in candles],
+            "high": [float(candle.high) for candle in candles],
+            "low": [float(candle.low) for candle in candles],
+            "close": [float(candle.close) for candle in candles],
+            "volume": [float(candle.volume) for candle in candles],
+        },
+        columns=[
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
         ],
-        columns=["timestamp", "open", "high", "low", "close", "volume"],
     )
 
 
 def _validate_market_data_result(
     market_data: MarketDataResult,
 ) -> tuple[str, str, tuple[Candle, ...]]:
+    """Validate the structural contract at the integration boundary."""
+
     if not isinstance(market_data, MarketDataResult):
-        raise IntegrationError("market_data must be a MarketDataResult")
+        raise IntegrationError(
+            "market_data must be a MarketDataResult"
+        )
 
     symbol = market_data.symbol.strip().upper()
     interval = market_data.interval.strip()
     candles = tuple(market_data.candles)
 
     if not symbol:
-        raise IntegrationError("market_data.symbol must be non-empty")
+        raise IntegrationError(
+            "market_data.symbol must be non-empty"
+        )
+
     if not interval:
-        raise IntegrationError("market_data.interval must be non-empty")
+        raise IntegrationError(
+            "market_data.interval must be non-empty"
+        )
+
     if len(candles) < 2:
-        raise IntegrationError("market_data must contain at least two candles")
+        raise IntegrationError(
+            "market_data must contain at least two candles"
+        )
+
     if any(not isinstance(candle, Candle) for candle in candles):
-        raise IntegrationError("market_data.candles must contain only Candle objects")
+        raise IntegrationError(
+            "market_data.candles must contain only Candle objects"
+        )
 
     previous_open: int | None = None
+
     for index, candle in enumerate(candles):
         if not candle.is_valid_ohlc:
-            raise IntegrationError(f"invalid OHLC candle at index {index}")
+            raise IntegrationError(
+                f"invalid OHLC candle at index {index}"
+            )
+
         if candle.close_time <= candle.open_time:
-            raise IntegrationError(f"invalid candle timestamps at index {index}")
-        if previous_open is not None and candle.open_time <= previous_open:
-            raise IntegrationError("market_data.candles must be strictly chronological")
+            raise IntegrationError(
+                f"invalid candle timestamps at index {index}"
+            )
+
+        if (
+            previous_open is not None
+            and candle.open_time <= previous_open
+        ):
+            raise IntegrationError(
+                "market_data.candles must be strictly chronological"
+            )
+
         previous_open = candle.open_time
 
     return symbol, interval, candles
@@ -233,41 +294,61 @@ def run_integrated_research(
     *,
     config: IntegrationConfig | None = None,
 ) -> IntegrationResult:
-    """Run the complete offline integration pipeline.
+    """Run the offline integration pipeline for one Spot market-data result.
 
-    A completed backtest is always preserved. Statistical inference is
-    fail-soft only at this orchestration boundary: domain-specific inference
-    errors are recorded and passed downstream to the Gate/Monitoring layers.
-    No invalid statistic is manufactured and no gate is bypassed.
+    The feature layer and the event-driven backtest both receive information
+    derived from the same completed-candle dataset.
+
+    Statistical inference fails softly only for the documented domain
+    errors. A failure is preserved in the result for downstream safeguards.
     """
-    cfg = config or IntegrationConfig()
-    symbol, interval, candles = _validate_market_data_result(market_data)
 
-    # 1. Feature layer: same completed candles, no future data.
+    cfg = config or IntegrationConfig()
+
+    symbol, interval, candles = _validate_market_data_result(
+        market_data
+    )
+
+    # 1. Feature engineering on the supplied completed candles.
     frame = _candles_to_frame(candles)
+
     try:
-        generated = build_features(frame, cfg.feature_config)
+        generated = build_features(
+            frame,
+            cfg.feature_config,
+        )
         validate_feature_output(generated)
     except Exception as exc:
-        raise IntegrationError(f"feature-engine integration failed: {exc}") from exc
+        raise IntegrationError(
+            f"feature-engine integration failed: {exc}"
+        ) from exc
 
     if len(generated) != len(candles):
-        raise IntegrationError("feature output row count does not match candle count")
+        raise IntegrationError(
+            "feature output row count does not match candle count"
+        )
 
     columns = tuple(feature_columns(generated))
 
-    # 2. Backtest layer: existing event-driven engine remains authoritative.
+    # 2. Existing event-driven backtest remains authoritative.
+    # The feature DataFrame is validated and reported but is not yet
+    # consumed by BacktestEngine as an input.
     try:
-        backtest = BacktestEngine(cfg.backtest_config).run(
+        backtest = BacktestEngine(
+            cfg.backtest_config
+        ).run(
             candles,
             symbol=symbol,
         )
     except Exception as exc:
-        raise IntegrationError(f"backtest integration failed: {exc}") from exc
+        raise IntegrationError(
+            f"backtest integration failed: {exc}"
+        ) from exc
 
-    # 3. Statistical validation: post-backtest only.
+    # 3. Statistical validation after the backtest has completed.
     statistical: StatisticalValidationReport | None = None
     statistical_error: str | None = None
+
     try:
         statistical = validate_backtest_result(
             backtest,
@@ -275,13 +356,12 @@ def run_integrated_research(
             benchmark_sharpe=cfg.benchmark_sharpe,
         )
     except StatisticalValidationError as exc:
-        # A mathematically undefined inference result is not a pipeline crash.
-        # Preserve the evidence and let the Production Gate block release.
         statistical_error = str(exc)
 
-    # 4. Dependence-aware bootstrap: consumes only the completed equity curve.
+    # 4. Dependence-aware bootstrap on the completed equity curve.
     bootstrap: BootstrapValidationReport | None = None
     bootstrap_error: str | None = None
+
     try:
         bootstrap = validate_backtest_result_with_bootstrap(
             backtest,
@@ -291,7 +371,6 @@ def run_integrated_research(
             risk_free_per_period=cfg.risk_free_per_period,
         )
     except BootstrapValidationError as exc:
-        # Same fail-soft rule: no fabricated confidence interval/statistic.
         bootstrap_error = str(exc)
 
     return IntegrationResult(
