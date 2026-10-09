@@ -1,3 +1,4 @@
+
 """
 EVA-AI-01
 =========
@@ -6,11 +7,17 @@ Application entry point.
 Startup flow
 ------------
 1. Validate static configuration.
-2. Optionally run one complete research cycle.
-3. Optionally send the resulting Phase-15-B report to Telegram.
+2. Keep research disabled by default.
+3. When enabled, run a research cycle for each configured Spot symbol.
+4. Print an independent report for each symbol.
+5. Send an independent Telegram diagnostic report for each symbol.
 
-Research runtime is disabled by default so that deployment/configuration
-changes cannot accidentally trigger external data processing.
+Safety
+------
+- Binance public market data only.
+- Spot research / paper analysis only.
+- No live orders are placed.
+- Telegram does not bypass the Production Gate.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from config.settings import (
 from core.application_runtime import (
     ApplicationRuntimeConfig,
     ApplicationRuntimeError,
-    run_research_cycle,
+    run_research_cycles,
 )
 from core.notification_layer import (
     NotificationError,
@@ -35,13 +42,20 @@ from core.notification_layer import (
 )
 
 
-def _parse_bool(value: str | None, default: bool = False) -> bool:
+def _parse_bool(
+    value: str | None,
+    default: bool = False,
+) -> bool:
+    """Parse a boolean environment variable safely."""
+
     if value is None or not value.strip():
         return default
 
     normalized = value.strip().lower()
+
     if normalized in {"1", "true", "yes", "on"}:
         return True
+
     if normalized in {"0", "false", "no", "off"}:
         return False
 
@@ -52,15 +66,17 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
 
 
 def main() -> int:
-    """Validate configuration and optionally execute one research cycle."""
+    """Validate configuration and optionally run multi-asset research."""
 
     print("=" * 72)
     print("EVA-AI-01")
     print("System initialization")
     print("=" * 72)
 
-    timestamp = datetime.now(timezone.utc).isoformat()
-    print(f"UTC time: {timestamp}")
+    print(
+        "UTC time: "
+        f"{datetime.now(timezone.utc).isoformat()}"
+    )
 
     try:
         settings = load_settings()
@@ -71,21 +87,21 @@ def main() -> int:
 
     print()
     print("Configuration:")
+
     for key, value in configuration_summary(settings).items():
         print(f"  {key}: {value}")
 
     print()
     print("Architecture:")
-    print("  Market Data")
+    print("  Binance Spot Public Market Data")
+    print("    -> Multi-Asset Research Runtime")
     print("    -> Feature Engineering")
-    print("    -> Backtest Engine")
-    print("       -> Signal / Regime / Volatility / Risk")
-    print("       -> Portfolio / Execution Simulator / Paper Trading")
+    print("    -> Backtest / Paper Research")
     print("    -> Statistical Validation")
     print("    -> Moving-Block Bootstrap")
     print("    -> Production Gate")
     print("    -> Monitoring")
-    print("    -> Phase-15-B Runtime")
+    print("    -> Per-Asset Research Report")
     print("    -> Optional Telegram Notification")
 
     try:
@@ -107,35 +123,110 @@ def main() -> int:
         return 0
 
     try:
-        runtime_config = ApplicationRuntimeConfig.from_environment()
-        run_result = run_research_cycle(runtime_config)
+        runtime_config = (
+            ApplicationRuntimeConfig.from_environment()
+        )
+
+        symbols = runtime_config.effective_symbols
 
         print()
-        print("Research runtime: COMPLETED")
-        print(f"Symbol: {run_result.symbol}")
-        print(f"Interval: {run_result.interval}")
-        print(f"Completed candles: {run_result.market_data.count}")
-        print(f"Phase-15-B status: {run_result.phase15b.status.value}")
-        print(f"Release ready: {run_result.release_ready}")
+        print("Research runtime: ENABLED")
+        print(f"Configured symbols: {len(symbols)}")
+
+        for symbol in symbols:
+            print(f"  - {symbol}")
+
+        # All configured symbols are processed independently.
+        # The runtime raises an error if a symbol fails; a partial batch
+        # is never silently presented as a complete research run.
+        results = run_research_cycles(runtime_config)
+
+        if not results:
+            raise ApplicationRuntimeError(
+                "The multi-asset runtime returned no results"
+            )
 
         print()
-        print(format_phase15b_message(run_result.phase15b))
+        print(f"Research cycles completed: {len(results)}")
 
+        ready_count = sum(
+            1
+            for result in results
+            if result.release_ready
+        )
+
+        print(f"Release-ready research results: {ready_count}")
+        print(f"Blocked research results: {len(results) - ready_count}")
+
+        # Construct one notifier and use it for each asset report.
         notifier = TelegramNotifier()
-        notification = notifier.send(run_result.phase15b)
-        print()
-        print(f"Telegram: {notification.message}")
+        notification_failures = 0
 
-    except (ApplicationRuntimeError, NotificationError, ValueError) as exc:
+        for index, result in enumerate(results, start=1):
+            print()
+            print("=" * 72)
+            print(f"Research result {index}/{len(results)}")
+            print(f"Symbol: {result.symbol}")
+            print(f"Interval: {result.interval}")
+            print(
+                "Completed candles: "
+                f"{result.market_data.count}"
+            )
+            print(
+                "Phase-15-B status: "
+                f"{result.phase15b.status.value}"
+            )
+            print(f"Release ready: {result.release_ready}")
+            print("-" * 72)
+
+            # The existing formatter includes the symbol, interval,
+            # validation results, and Production Gate diagnostics.
+            report = format_phase15b_message(result.phase15b)
+            print(report)
+
+            # A notification failure for one symbol must not prevent
+            # attempts for the remaining symbols.
+            try:
+                notification = notifier.send(result.phase15b)
+                print()
+                print(f"Telegram [{result.symbol}]: {notification.message}")
+
+            except NotificationError as exc:
+                notification_failures += 1
+                print()
+                print(f"Telegram [{result.symbol}]: FAILED")
+                print(f"Reason: {exc}")
+
+        print()
+        print("=" * 72)
+
+        if notification_failures:
+            print("Status: RUNTIME_COMPLETED_WITH_NOTIFICATION_ERRORS")
+            print(
+                "Notification failures: "
+                f"{notification_failures}"
+            )
+            print("Safety: no live trading path was invoked")
+            print("=" * 72)
+            return 1
+
+    except (
+        ApplicationRuntimeError,
+        NotificationError,
+        ValueError,
+    ) as exc:
         print()
         print("Status: RUNTIME_ERROR")
         print(f"Reason: {exc}")
+        print("Safety: no live order was placed")
         return 1
 
     print()
     print("Status: RUNTIME_OK")
-    print("Safety: no live trading path is enabled")
+    print("Safety: research/paper analysis only")
+    print("Safety: no live orders were placed")
     print("=" * 72)
+
     return 0
 
 
