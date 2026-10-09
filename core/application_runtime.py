@@ -1,41 +1,13 @@
 """
 EVA-AI-01 - Application Runtime
-===============================
-Final runtime composition for the research-only pipeline.
 
-Runtime flow
-------------
-Public Binance Spot OHLCV
-    -> MarketData validation
-    -> Feature Engineering
-    -> BacktestEngine
-       -> Signal
-       -> Regime
-       -> Volatility
-       -> Risk
-       -> Portfolio
-       -> Execution Simulator
-       -> Paper Trading
-    -> Statistical Validation
-    -> Moving-Block Bootstrap
-    -> Production Gate
-    -> Monitoring
-    -> Phase-15-B result
-
-Safety
-------
-This module is research/paper-only:
-- public Binance market data only;
-- no API keys are used for market-data retrieval;
-- no exchange orders are placed;
-- no leverage or margin;
-- no shorting;
-- no live trading authorization.
+Research-only runtime supporting one or multiple explicitly configured
+Binance Spot symbols. This module never places exchange orders.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import os
 from typing import Any
@@ -64,6 +36,7 @@ def _parse_int(name: str, default: int, *, minimum: int = 0) -> int:
         raise ApplicationRuntimeError(
             f"{name} must be an integer; received {raw!r}"
         ) from exc
+
     if value < minimum:
         raise ApplicationRuntimeError(
             f"{name} must be >= {minimum}; received {value}"
@@ -74,28 +47,61 @@ def _parse_int(name: str, default: int, *, minimum: int = 0) -> int:
 def _parse_float(name: str, default: float) -> float:
     raw = _env(name, str(default))
     try:
-        value = float(raw)
+        return float(raw)
     except ValueError as exc:
         raise ApplicationRuntimeError(
             f"{name} must be numeric; received {raw!r}"
         ) from exc
-    return value
 
 
 def _parse_bool(name: str, default: bool = False) -> bool:
     raw = _env(name, "true" if default else "false").lower()
+
     if raw in {"1", "true", "yes", "on"}:
         return True
     if raw in {"0", "false", "no", "off"}:
         return False
+
     raise ApplicationRuntimeError(
         f"{name} must be boolean (true/false, yes/no, 1/0)"
     )
 
 
+def _normalize_symbols(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Normalize symbols and reject empty values or duplicates."""
+
+    if isinstance(values, (str, bytes)):
+        raise ApplicationRuntimeError(
+            "symbols must be a sequence of symbols, not a single string"
+        )
+
+    try:
+        normalized = tuple(value.strip().upper() for value in values)
+    except (AttributeError, TypeError) as exc:
+        raise ApplicationRuntimeError(
+            "symbols must contain strings"
+        ) from exc
+
+    if not normalized:
+        raise ApplicationRuntimeError("symbols cannot be empty")
+
+    for symbol in normalized:
+        if not symbol or not symbol.isalnum():
+            raise ApplicationRuntimeError(
+                f"invalid symbol: {symbol!r}"
+            )
+
+    if len(set(normalized)) != len(normalized):
+        raise ApplicationRuntimeError(
+            "symbols must not contain duplicates"
+        )
+
+    return normalized
+
+
 @dataclass(frozen=True)
 class ApplicationRuntimeConfig:
-    """Immutable configuration for one research runtime cycle."""
+    """Immutable configuration for the research runtime."""
 
     symbol: str = "BTCUSDT"
     interval: str = "1m"
@@ -112,7 +118,14 @@ class ApplicationRuntimeConfig:
 
     strict: bool = False
 
+    # Optional explicit multi-symbol list. An empty tuple preserves the
+    # legacy single-symbol behavior through the "symbol" field.
+    symbols: tuple[str, ...] = ()
+
     def __post_init__(self) -> None:
+        if not isinstance(self.symbol, str):
+            raise ApplicationRuntimeError("symbol must be a string")
+
         symbol = self.symbol.strip().upper()
         interval = self.interval.strip()
 
@@ -122,6 +135,15 @@ class ApplicationRuntimeConfig:
             )
         if not interval:
             raise ApplicationRuntimeError("interval must be non-empty")
+
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "interval", interval)
+
+        if self.symbols:
+            normalized_symbols = _normalize_symbols(self.symbols)
+            object.__setattr__(self, "symbols", normalized_symbols)
+        else:
+            object.__setattr__(self, "symbols", ())
 
         if self.market_data_limit < self.minimum_candles:
             raise ApplicationRuntimeError(
@@ -142,12 +164,21 @@ class ApplicationRuntimeConfig:
                 "bootstrap_block_length must be >= 2"
             )
 
+    @property
+    def effective_symbols(self) -> tuple[str, ...]:
+        """Return configured symbols, preserving legacy single-symbol use."""
+        return self.symbols or (self.symbol,)
+
     @classmethod
     def from_environment(cls) -> "ApplicationRuntimeConfig":
-        """Load research-runtime configuration from environment variables."""
+        """Load configuration from environment variables.
+
+        EVA_SYMBOLS takes precedence when supplied, for example:
+        EVA_SYMBOLS=BTCUSDT,ETHUSDT
+        Otherwise EVA_SYMBOL retains its original behavior.
+        """
 
         seed_raw = _env("EVA_BOOTSTRAP_SEED", "42")
-        bootstrap_seed: int | None
         if seed_raw.lower() in {"none", "null"}:
             bootstrap_seed = None
         else:
@@ -158,53 +189,49 @@ class ApplicationRuntimeConfig:
                     "EVA_BOOTSTRAP_SEED must be an integer or 'none'"
                 ) from exc
 
+        symbols_raw = os.getenv("EVA_SYMBOLS", "").strip()
+        if symbols_raw:
+            symbols = _normalize_symbols(
+                tuple(part.strip() for part in symbols_raw.split(","))
+            )
+            primary_symbol = symbols[0]
+        else:
+            symbols = ()
+            primary_symbol = _env("EVA_SYMBOL", "BTCUSDT")
+
         return cls(
-            symbol=_env("EVA_SYMBOL", "BTCUSDT"),
+            symbol=primary_symbol,
+            symbols=symbols,
             interval=_env("EVA_INTERVAL", "1m"),
             market_data_limit=_parse_int(
-                "EVA_MARKET_DATA_LIMIT",
-                500,
-                minimum=120,
+                "EVA_MARKET_DATA_LIMIT", 500, minimum=120
             ),
             minimum_candles=_parse_int(
-                "EVA_MINIMUM_CANDLES",
-                240,
-                minimum=120,
+                "EVA_MINIMUM_CANDLES", 240, minimum=120
             ),
             number_of_trials=_parse_int(
-                "EVA_NUMBER_OF_TRIALS",
-                2,
-                minimum=2,
+                "EVA_NUMBER_OF_TRIALS", 2, minimum=2
             ),
             benchmark_sharpe=_parse_float(
-                "EVA_BENCHMARK_SHARPE",
-                0.0,
+                "EVA_BENCHMARK_SHARPE", 0.0
             ),
             bootstrap_replications=_parse_int(
-                "EVA_BOOTSTRAP_REPLICATIONS",
-                200,
-                minimum=200,
+                "EVA_BOOTSTRAP_REPLICATIONS", 200, minimum=200
             ),
             bootstrap_block_length=_parse_int(
-                "EVA_BOOTSTRAP_BLOCK_LENGTH",
-                5,
-                minimum=2,
+                "EVA_BOOTSTRAP_BLOCK_LENGTH", 5, minimum=2
             ),
             bootstrap_seed=bootstrap_seed,
             risk_free_per_period=_parse_float(
-                "EVA_RISK_FREE_PER_PERIOD",
-                0.0,
+                "EVA_RISK_FREE_PER_PERIOD", 0.0
             ),
-            strict=_parse_bool(
-                "EVA_RUNTIME_STRICT",
-                False,
-            ),
+            strict=_parse_bool("EVA_RUNTIME_STRICT", False),
         )
 
 
 @dataclass(frozen=True)
 class ApplicationRuntimeResult:
-    """Auditable output of one complete research runtime cycle."""
+    """Auditable output of one complete research cycle."""
 
     started_at_utc: str
     finished_at_utc: str
@@ -242,7 +269,7 @@ class ApplicationRuntimeResult:
 def build_phase15b_config(
     config: ApplicationRuntimeConfig,
 ) -> Phase15BConfig:
-    """Translate application settings into the stable Phase-15-B contract."""
+    """Translate application settings into the Phase-15-B contract."""
 
     integration_config = IntegrationConfig(
         number_of_trials=config.number_of_trials,
@@ -264,16 +291,10 @@ def run_research_cycle(
     *,
     market_client: BinanceMarketDataClient | None = None,
 ) -> ApplicationRuntimeResult:
-    """
-    Fetch completed Spot candles and execute the complete research pipeline.
-
-    The public Binance client is used only for market data. No credentials or
-    trading endpoints are involved.
-    """
+    """Run one research cycle for config.symbol using public Spot data."""
 
     cfg = config or ApplicationRuntimeConfig.from_environment()
     client = market_client or BinanceMarketDataClient()
-
     started = datetime.now(timezone.utc).isoformat()
 
     try:
@@ -284,13 +305,13 @@ def run_research_cycle(
         )
     except Exception as exc:
         raise ApplicationRuntimeError(
-            f"market-data acquisition failed: {exc}"
+            f"market-data acquisition failed for {cfg.symbol}: {exc}"
         ) from exc
 
     if market_data.count < cfg.minimum_candles:
         raise ApplicationRuntimeError(
-            f"only {market_data.count} completed candles were available; "
-            f"minimum required is {cfg.minimum_candles}"
+            f"{cfg.symbol}: only {market_data.count} completed candles "
+            f"were available; minimum required is {cfg.minimum_candles}"
         )
 
     phase15b_config = build_phase15b_config(cfg)
@@ -302,7 +323,7 @@ def run_research_cycle(
         )
     except Exception as exc:
         raise ApplicationRuntimeError(
-            f"research pipeline execution failed: {exc}"
+            f"research pipeline execution failed for {cfg.symbol}: {exc}"
         ) from exc
 
     finished = datetime.now(timezone.utc).isoformat()
@@ -315,10 +336,41 @@ def run_research_cycle(
     )
 
 
+def run_research_cycles(
+    config: ApplicationRuntimeConfig | None = None,
+    *,
+    market_client: BinanceMarketDataClient | None = None,
+) -> tuple[ApplicationRuntimeResult, ...]:
+    """Run one independent research cycle per configured symbol.
+
+    Results are returned in the same order as the configured symbols.
+    If a symbol fails, the function raises an error rather than silently
+    presenting a partial batch as complete.
+    """
+
+    cfg = config or ApplicationRuntimeConfig.from_environment()
+    results: list[ApplicationRuntimeResult] = []
+
+    for symbol in cfg.effective_symbols:
+        single_symbol_config = replace(
+            cfg,
+            symbol=symbol,
+            symbols=(),
+        )
+        result = run_research_cycle(
+            single_symbol_config,
+            market_client=market_client,
+        )
+        results.append(result)
+
+    return tuple(results)
+
+
 __all__ = [
     "ApplicationRuntimeConfig",
     "ApplicationRuntimeError",
     "ApplicationRuntimeResult",
     "build_phase15b_config",
     "run_research_cycle",
+    "run_research_cycles",
 ]
